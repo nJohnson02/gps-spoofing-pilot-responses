@@ -1,113 +1,77 @@
--- spoof_injection_v4.lua
--- Uses Direct Draw method to ensure buttons appear
-[cite_start]-- Logic based on Annex 2 of the provided document [cite: 121-160]
+-- spoof_manual_trigger.lua
+-- Replicates the manual button trigger from the PDF Annex 2
 
 if not SUPPORTS_FLOATING_WINDOWS then
-    logMsg("Imgui not supported. Script stopped.")
+    logMsg("Imgui not supported.")
     return
 end
 
--- 1. Variable Initialization (Global to ensure access)
-spoofing_active = {
-    dist_drift = false,    -- Distance Spoof
-    course_drift = false,  -- Course Spoof
-    heading_drift = false  -- Heading Spoof
+-- 1. State Variables (The "Triggers")
+local spoof_active = {
+    dist = false,
+    course = false,
+    heading = false
 }
 
-current_spoof = {
-    dist = 0, 
-    course = 0, 
-    heading = 0
-}
+-- 2. Storage for the drifting values
+local spoof_val = { dist=0, course=0, heading=0 }
 
-[cite_start]-- 2. Spoof Parameters (Drift Rates) [cite: 114-116]
-local variation = {
-    dist = -20.0,      -- Meters per frame
-    course = 0.1,      -- Degrees per frame
-    heading = -0.1     -- Degrees per frame
-}
+-- 3. The Drift Rates (From PDF)
+local rates = { dist = -20.0, course = 0.1, heading = -0.1 }
 
--- 3. Main Spoofing Logic (Runs every physics frame)
-function spoof_gps_logic()
-    -- Check if ANY spoofing is active to trigger the GPS Override
-    local override_needed = spoofing_active.dist_drift or spoofing_active.course_drift or 
-                            spoofing_active.heading_drift
-    
-    if override_needed then
+-- 4. Main Logic Loop
+function update_spoofing()
+    -- Check if we need to override the GPS
+    if spoof_active.dist or spoof_active.course or spoof_active.heading then
         set("sim/operation/override/override_gps", 1)
     else
         set("sim/operation/override/override_gps", 0)
     end
 
-    -- === Distance Spoofing ===
-    if spoofing_active.dist_drift then
-        if current_spoof.dist == 0 then 
-            current_spoof.dist = get("sim/cockpit/radios/gps_dme_dist_m") 
-        end
-        current_spoof.dist = current_spoof.dist + variation.dist
-        if current_spoof.dist < 0 then current_spoof.dist = 0 end 
-        set("sim/cockpit/radios/gps_dme_dist_m", current_spoof.dist)
+    -- Distance Logic
+    if spoof_active.dist then
+        if spoof_val.dist == 0 then spoof_val.dist = get("sim/cockpit/radios/gps_dme_dist_m") end
+        spoof_val.dist = spoof_val.dist + rates.dist
+        if spoof_val.dist < 0 then spoof_val.dist = 0 end
+        set("sim/cockpit/radios/gps_dme_dist_m", spoof_val.dist)
     else
-        current_spoof.dist = 0 
+        spoof_val.dist = 0 
     end
 
-    -- === Course Spoofing ===
-    if spoofing_active.course_drift then
-        if current_spoof.course == 0 then 
-            current_spoof.course = get("sim/cockpit/radios/gps_course_degtm") 
-        end
-        current_spoof.course = (current_spoof.course + variation.course) % 360 
-        set("sim/cockpit/radios/gps_course_degtm", current_spoof.course)
+    -- Heading Logic
+    if spoof_active.heading then
+        if spoof_val.heading == 0 then spoof_val.heading = get("sim/cockpit/autopilot/heading_mag") end
+        spoof_val.heading = spoof_val.heading + rates.heading
+        set("sim/cockpit/autopilot/heading_mag", spoof_val.heading)
     else
-        current_spoof.course = 0
-    end
-
-    -- === Heading Spoofing ===
-    if spoofing_active.heading_drift then
-        if current_spoof.heading == 0 then 
-            current_spoof.heading = get("sim/cockpit/autopilot/heading_mag") 
-        end
-        current_spoof.heading = current_spoof.heading + variation.heading
-        set("sim/cockpit/autopilot/heading_mag", current_spoof.heading)
-    else
-        current_spoof.heading = 0
+        spoof_val.heading = 0
     end
 end
 
--- 4. UI Drawing Logic (Runs every graphics frame)
--- This manually creates the window, bypassing the "helper" that was causing the blank square.
-function draw_spoof_panel()
-    -- Create the window. The "nil" argument means it stays open until script stops.
-    -- We use "AlwaysAutoResize" so the window shrinks/grows to fit the buttons.
-    if imgui.Begin("GPS Attack Panel", nil, imgui.constant.WindowFlags.AlwaysAutoResize) then
+-- 5. The Trigger UI (Simplified)
+function draw_triggers()
+    -- Create a fixed window at 50, 50 (Top Left) to ensure it never disappears
+    imgui.SetNextWindowPos(50, 50, imgui.constant.Cond.FirstUseEver)
+    imgui.SetNextWindowSize(200, 150, imgui.constant.Cond.FirstUseEver)
+    
+    if imgui.Begin("Spoof Triggers", nil, imgui.constant.WindowFlags.NoResize) then
         
-        imgui.Text("Select Data to Corrupt:")
-        imgui.Separator()
-        
-        -- Distance Toggle
-        if imgui.Button(spoofing_active.dist_drift and "DIST Drift: ON" or "DIST Drift: OFF") then
-            spoofing_active.dist_drift = not spoofing_active.dist_drift
-            -- Reset logic to prevent jumps when turning back on
-            if not spoofing_active.dist_drift then current_spoof.dist = 0 end
-        end
-        
-        -- Course Toggle
-        if imgui.Button(spoofing_active.course_drift and "CRS Drift: ON" or "CRS Drift: OFF") then
-            spoofing_active.course_drift = not spoofing_active.course_drift
-             if not spoofing_active.course_drift then current_spoof.course = 0 end
+        -- Button 1: Distance
+        if imgui.Button(spoof_active.dist and "DIST: ACTIVE" or "Activate Distance") then
+            spoof_active.dist = not spoof_active.dist
+            if not spoof_active.dist then spoof_val.dist = 0 end -- Reset on deactivate
         end
 
-        -- Heading Toggle
-        if imgui.Button(spoofing_active.heading_drift and "HDG Drift: ON" or "HDG Drift: OFF") then
-            spoofing_active.heading_drift = not spoofing_active.heading_drift
-             if not spoofing_active.heading_drift then current_spoof.heading = 0 end
+        -- Button 2: Heading
+        if imgui.Button(spoof_active.heading and "HDG: ACTIVE" or "Activate Heading") then
+            spoof_active.heading = not spoof_active.heading
+            if not spoof_active.heading then spoof_val.heading = 0 end -- Reset on deactivate
         end
 
     end
-    -- Close the window context
     imgui.End()
 end
 
--- 5. Registration
-do_every_frame("spoof_gps_logic()") -- Updates physics
-do_every_draw("draw_spoof_panel()") -- Updates graphics
+-- Register functions
+do_every_frame("update_spoofing()")
+do_every_draw("draw_triggers()")
