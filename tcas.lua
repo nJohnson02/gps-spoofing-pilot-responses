@@ -1,59 +1,181 @@
 -- =============================================================
--- GPS/ADS-B Spoofing Script (Fixed for FWL NG/XP12)
+-- TCAS RA GENERATOR (V23 - FULL KINEMATIC LOOP)
+-- 1. Updates Position (Move to User).
+-- 2. Updates Heading (Face User).
+-- 3. Updates VELOCITY VECTORS (Match Heading).
+--    This ensures G1000 sees a valid motion vector.
 -- =============================================================
 
-local ffi = require("ffi")
-
--- Define C function for coordinate conversion
-ffi.cdef[[
-    void XPLMWorldToLocal(double inLatitude, double inLongitude, double inAltitude, double *outX, double *outY, double *outZ);
-]]
-
-local outX = ffi.new("double[1]")
-local outY = ffi.new("double[1]")
-local outZ = ffi.new("double[1]")
+local SCRIPT_NAME = "TCAS V23 (Kinematic)"
 
 -- =============================================================
--- CONFIGURATION
--- =============================================================
-local spoof_lat = 47.445 
-local spoof_lon = -122.305
-local spoof_alt_ft = 3000
-
--- =============================================================
--- STABLE DATAREF MAPPING
+-- 1. DATAREFS
 -- =============================================================
 
--- 1. The Override Switch (Single Value)
--- We bind this to a Lua variable named 'OverrideTCAS'
-DataRef("OverrideTCAS", "sim/operation/override/override_tcas", "writable")
+-- USER
+local DR_u_x     = XPLMFindDataRef("sim/flightmodel/position/local_x")
+local DR_u_y     = XPLMFindDataRef("sim/flightmodel/position/local_y")
+local DR_u_z     = XPLMFindDataRef("sim/flightmodel/position/local_z")
+local DR_u_psi   = XPLMFindDataRef("sim/flightmodel/position/psi")
 
--- 2. The Target Data (Specific Array Index)
--- Instead of trying to read the whole table, we bind DIRECTLY to Target #1.
--- (Index 1 is actually the 2nd slot, 0 is the 1st. This is safe.)
-DataRef("GhostX", "sim/cockpit2/tcas/targets/position_x", "writable", 1)
-DataRef("GhostY", "sim/cockpit2/tcas/targets/position_y", "writable", 1)
-DataRef("GhostZ", "sim/cockpit2/tcas/targets/position_z", "writable", 1)
-DataRef("GhostMode", "sim/cockpit2/tcas/targets/mode", "writable", 1)
+-- AI POSITION
+local DR_ai_x    = XPLMFindDataRef("sim/multiplayer/position/plane1_x")
+local DR_ai_y    = XPLMFindDataRef("sim/multiplayer/position/plane1_y")
+local DR_ai_z    = XPLMFindDataRef("sim/multiplayer/position/plane1_z")
+local DR_ai_psi  = XPLMFindDataRef("sim/multiplayer/position/plane1_psi")
+local DR_ai_the  = XPLMFindDataRef("sim/multiplayer/position/plane1_the")
+local DR_ai_phi  = XPLMFindDataRef("sim/multiplayer/position/plane1_phi")
+
+-- AI PHYSICS (The Missing Link)
+local DR_ai_vx   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_x")
+local DR_ai_vy   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_y")
+local DR_ai_vz   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_z")
+
+-- OVERRIDE
+local DR_ovr_pos = XPLMFindDataRef("sim/operation/override/override_plane_ai_1")
 
 -- =============================================================
--- MAIN LOOP
+-- 2. STATE
 -- =============================================================
-function update_spoofing_signal()
-    -- Enable the override
-    OverrideTCAS = 1
 
-    -- Convert Lat/Lon to Local X/Y/Z
-    local alt_meters = spoof_alt_ft * 0.3048
-    ffi.C.XPLMWorldToLocal(spoof_lat, spoof_lon, alt_meters, outX, outY, outZ)
+local active = false
+local SPEED_KTS = 550
+local R2D = 180.0 / math.pi
+local D2R = math.pi / 180.0
+local NM_TO_M = 1852.0
 
-    -- Write to the variables we defined above
-    GhostX = outX[0]
-    GhostY = outY[0]
-    GhostZ = outZ[0]
-    
-    -- Mode 3 = Active Mode C/S Transponder
-    GhostMode = 3
+-- Internal Tracking
+local g_x = 0
+local g_y = 0
+local g_z = 0
+
+-- =============================================================
+-- 3. LOGIC LOOP
+-- =============================================================
+
+function loop_tcas_v23()
+    -- 1. Manage Override
+    if not active then
+        if DR_ovr_pos and XPLMGetDatai(DR_ovr_pos) == 1 then
+             XPLMSetDatai(DR_ovr_pos, 0)
+        end
+        return
+    end
+
+    -- Force Physics Override (God Mode)
+    if DR_ovr_pos then XPLMSetDatai(DR_ovr_pos, 1) end
+
+    -- 2. Get User Pos
+    local u_x = XPLMGetDataf(DR_u_x)
+    local u_y = XPLMGetDataf(DR_u_y)
+    local u_z = XPLMGetDataf(DR_u_z)
+
+    -- 3. Calculate Vector To User
+    local dx = u_x - g_x
+    local dy = u_y - g_y
+    local dz = u_z - g_z
+    local dist = math.sqrt(dx*dx + dz*dz)
+
+    -- 4. Move Ghost (Position Update)
+    local tick = 0.05
+    if SUPPORTS_FLOATING_WINDOWS == 1 then tick = 0.02 end
+    local move_step = (SPEED_KTS * 0.5144) * tick
+
+    if dist > 20 then
+        -- Normalize
+        local nx = dx / dist
+        local nz = dz / dist
+        
+        g_x = g_x + (nx * move_step)
+        g_z = g_z + (nz * move_step)
+        g_y = u_y -- Vertical Lock
+        
+        -- 5. Calculate Heading (Look where we are going)
+        -- atan2(x, -z) = Heading
+        local trk_rad = math.atan2(nx, -nz)
+        local trk_deg = trk_rad * R2D
+        if trk_deg < 0 then trk_deg = trk_deg + 360 end
+        
+        -- 6. CALCULATE VELOCITY VECTORS
+        -- This is the key. We match the dataref velocity to our movement.
+        local speed_mps = SPEED_KTS * 0.5144
+        
+        -- Re-calculate velocity components based on the Heading we just derived
+        -- X-Plane Trig: X = sin(psi), Z = -cos(psi)
+        local v_x = math.sin(trk_rad) * speed_mps
+        local v_z = -math.cos(trk_rad) * speed_mps
+        
+        -- 7. INJECT EVERYTHING
+        if DR_ai_x then XPLMSetDataf(DR_ai_x, g_x) end
+        if DR_ai_y then XPLMSetDataf(DR_ai_y, g_y) end
+        if DR_ai_z then XPLMSetDataf(DR_ai_z, g_z) end
+        
+        if DR_ai_psi then XPLMSetDataf(DR_ai_psi, trk_deg) end
+        if DR_ai_the then XPLMSetDataf(DR_ai_the, 0) end
+        if DR_ai_phi then XPLMSetDataf(DR_ai_phi, 0) end
+        
+        -- Inject the Physics Vectors
+        if DR_ai_vx then XPLMSetDataf(DR_ai_vx, v_x) end
+        if DR_ai_vz then XPLMSetDataf(DR_ai_vz, v_z) end
+        if DR_ai_vy then XPLMSetDataf(DR_ai_vy, 0) end
+    end
+
+    -- Auto-Abort
+    if dist < 50 then active = false end
 end
 
-do_every_frame("update_spoofing_signal()")
+do_every_frame("loop_tcas_v23()")
+
+-- =============================================================
+-- 4. SPAWN LOGIC
+-- =============================================================
+
+function spawn_kinematic()
+    local u_x = XPLMGetDataf(DR_u_x)
+    local u_y = XPLMGetDataf(DR_u_y)
+    local u_z = XPLMGetDataf(DR_u_z)
+    local u_psi = XPLMGetDataf(DR_u_psi)
+    
+    -- Spawn 5 NM Ahead
+    local dist_m = 5.0 * NM_TO_M
+    local sin_v = math.sin(u_psi * D2R)
+    local cos_v = math.cos(u_psi * D2R)
+    
+    g_x = u_x + (sin_v * dist_m)
+    g_z = u_z - (cos_v * dist_m)
+    g_y = u_y
+    
+    active = true
+end
+
+-- =============================================================
+-- 5. GUI
+-- =============================================================
+
+function draw_tcas_gui()
+    imgui.TextUnformatted(SCRIPT_NAME)
+    imgui.Separator()
+
+    if active then
+        imgui.TextUnformatted("!!! KINEMATIC LOOP !!!")
+        
+        local u_x = XPLMGetDataf(DR_u_x)
+        local u_z = XPLMGetDataf(DR_u_z)
+        local dx = g_x - u_x
+        local dz = g_z - u_z
+        local dist_nm = math.sqrt(dx*dx + dz*dz) / NM_TO_M
+        
+        imgui.TextUnformatted(string.format("Range: %.1f NM", dist_nm))
+        
+        if imgui.Button("ABORT") then active = false end
+    else
+        imgui.TextUnformatted("Status: READY")
+        if imgui.Button("SPAWN THREAT") then
+            spawn_kinematic()
+        end
+    end
+end
+
+local wnd = float_wnd_create(250, 250, 1, true)
+float_wnd_set_title(wnd, "TCAS V23")
+float_wnd_set_imgui_builder(wnd, "draw_tcas_gui")
