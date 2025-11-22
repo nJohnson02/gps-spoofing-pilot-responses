@@ -55,7 +55,7 @@ local current_drift_nm = 0
 local CONFIG = {
     -- DRIFT RATE (NM per frame)
     -- 0.0003 is approx 0.5 NM per minute.
-    drift_rate_nm = 0.0003,
+    drift_rate_nm = 0.0001,
     
     -- SENSITIVITY (For Dot Conversion)
     -- 0.3 NM = Full Scale (Approach Mode)
