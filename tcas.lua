@@ -3,7 +3,6 @@
 -- 1. Updates Position (Move to User).
 -- 2. Updates Heading (Face User).
 -- 3. Updates VELOCITY VECTORS (Match Heading).
---    This ensures G1000 sees a valid motion vector.
 -- =============================================================
 
 local SCRIPT_NAME = "TCAS V23 (Kinematic)"
@@ -11,6 +10,9 @@ local SCRIPT_NAME = "TCAS V23 (Kinematic)"
 -- =============================================================
 -- 1. DATAREFS
 -- =============================================================
+
+-- SYSTEM
+local DR_sim_period = XPLMFindDataRef("sim/operation/misc/frame_rate_period")
 
 -- USER
 local DR_u_x     = XPLMFindDataRef("sim/flightmodel/position/local_x")
@@ -26,7 +28,7 @@ local DR_ai_psi  = XPLMFindDataRef("sim/multiplayer/position/plane1_psi")
 local DR_ai_the  = XPLMFindDataRef("sim/multiplayer/position/plane1_the")
 local DR_ai_phi  = XPLMFindDataRef("sim/multiplayer/position/plane1_phi")
 
--- AI PHYSICS (The Missing Link)
+-- AI PHYSICS
 local DR_ai_vx   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_x")
 local DR_ai_vy   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_y")
 local DR_ai_vz   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_z")
@@ -43,6 +45,7 @@ local SPEED_KTS = 550
 local R2D = 180.0 / math.pi
 local D2R = math.pi / 180.0
 local NM_TO_M = 1852.0
+local ALT_OFFSET_M = 60.96 -- 200 ft offset to avoid self-filtering
 
 -- Internal Tracking
 local g_x = 0
@@ -77,31 +80,31 @@ function loop_tcas_v23()
     local dist = math.sqrt(dx*dx + dz*dz)
 
     -- 4. Move Ghost (Position Update)
-    local tick = 0.05
-    if SUPPORTS_FLOATING_WINDOWS == 1 then tick = 0.02 end
-    local move_step = (SPEED_KTS * 0.5144) * tick
+    -- Use actual simulation time (dt) for smooth interpolation
+    local dt = XPLMGetDataf(DR_sim_period)
+    local speed_mps = SPEED_KTS * 0.5144
+    local move_step = speed_mps * dt
 
     if dist > 20 then
-        -- Normalize
+        -- Normalize Direction
         local nx = dx / dist
         local nz = dz / dist
         
+        -- Update Position
         g_x = g_x + (nx * move_step)
         g_z = g_z + (nz * move_step)
-        g_y = u_y -- Vertical Lock
+        
+        -- Vertical Lock with Offset (Ghost is below User)
+        g_y = u_y - ALT_OFFSET_M
         
         -- 5. Calculate Heading (Look where we are going)
-        -- atan2(x, -z) = Heading
+        -- atan2(x, -z) = Heading in X-Plane coordinates
         local trk_rad = math.atan2(nx, -nz)
         local trk_deg = trk_rad * R2D
         if trk_deg < 0 then trk_deg = trk_deg + 360 end
         
         -- 6. CALCULATE VELOCITY VECTORS
-        -- This is the key. We match the dataref velocity to our movement.
-        local speed_mps = SPEED_KTS * 0.5144
-        
-        -- Re-calculate velocity components based on the Heading we just derived
-        -- X-Plane Trig: X = sin(psi), Z = -cos(psi)
+        -- The G1000 needs the velocity vector to match the position update
         local v_x = math.sin(trk_rad) * speed_mps
         local v_z = -math.cos(trk_rad) * speed_mps
         
@@ -120,7 +123,7 @@ function loop_tcas_v23()
         if DR_ai_vy then XPLMSetDataf(DR_ai_vy, 0) end
     end
 
-    -- Auto-Abort
+    -- Auto-Abort on Impact/Near Miss
     if dist < 50 then active = false end
 end
 
@@ -143,7 +146,9 @@ function spawn_kinematic()
     
     g_x = u_x + (sin_v * dist_m)
     g_z = u_z - (cos_v * dist_m)
-    g_y = u_y
+    
+    -- Initialize altitude with the offset so it doesn't jump
+    g_y = u_y - ALT_OFFSET_M
     
     active = true
 end
@@ -157,7 +162,7 @@ function draw_tcas_gui()
     imgui.Separator()
 
     if active then
-        imgui.TextUnformatted("!!! KINEMATIC LOOP !!!")
+        imgui.TextUnformatted("!!! KINEMATIC LOOP ACTIVE !!!")
         
         local u_x = XPLMGetDataf(DR_u_x)
         local u_z = XPLMGetDataf(DR_u_z)
@@ -166,16 +171,17 @@ function draw_tcas_gui()
         local dist_nm = math.sqrt(dx*dx + dz*dz) / NM_TO_M
         
         imgui.TextUnformatted(string.format("Range: %.1f NM", dist_nm))
+        imgui.TextUnformatted(string.format("Speed: %d KTS", SPEED_KTS))
         
         if imgui.Button("ABORT") then active = false end
     else
         imgui.TextUnformatted("Status: READY")
-        if imgui.Button("SPAWN THREAT") then
+        if imgui.Button("SPAWN THREAT (5NM)") then
             spawn_kinematic()
         end
     end
 end
 
-local wnd = float_wnd_create(250, 250, 1, true)
+local wnd = float_wnd_create(250, 150, 1, true)
 float_wnd_set_title(wnd, "TCAS V23")
 float_wnd_set_imgui_builder(wnd, "draw_tcas_gui")
