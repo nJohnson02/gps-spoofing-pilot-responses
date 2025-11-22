@@ -1,163 +1,181 @@
 -- =============================================================
--- TCAS RA GENERATOR (V08 - VECTOR ALIGNMENT)
--- Heading is now calculated from actual motion vector.
--- This ensures the ADS-B arrow always points correctly.
+-- TCAS RA GENERATOR (V23 - FULL KINEMATIC LOOP)
+-- 1. Updates Position (Move to User).
+-- 2. Updates Heading (Face User).
+-- 3. Updates VELOCITY VECTORS (Match Heading).
+--    This ensures G1000 sees a valid motion vector.
 -- =============================================================
 
-local SCRIPT_NAME = "TCAS V08 (Vector Fix)"
+local SCRIPT_NAME = "TCAS V23 (Kinematic)"
 
 -- =============================================================
--- 1. DATAREF MAPPING
+-- 1. DATAREFS
 -- =============================================================
 
--- USER (Read)
-local DR_user_x   = XPLMFindDataRef("sim/flightmodel/position/local_x")
-local DR_user_y   = XPLMFindDataRef("sim/flightmodel/position/local_y")
-local DR_user_z   = XPLMFindDataRef("sim/flightmodel/position/local_z")
-local DR_user_psi = XPLMFindDataRef("sim/flightmodel/position/psi") 
-local DR_user_agl = XPLMFindDataRef("sim/flightmodel/position/y_agl")
+-- USER
+local DR_u_x     = XPLMFindDataRef("sim/flightmodel/position/local_x")
+local DR_u_y     = XPLMFindDataRef("sim/flightmodel/position/local_y")
+local DR_u_z     = XPLMFindDataRef("sim/flightmodel/position/local_z")
+local DR_u_psi   = XPLMFindDataRef("sim/flightmodel/position/psi")
 
--- AI AIRCRAFT 1 (Write)
-local DR_ai1_x    = XPLMFindDataRef("sim/multiplayer/position/plane1_x")
-local DR_ai1_y    = XPLMFindDataRef("sim/multiplayer/position/plane1_y")
-local DR_ai1_z    = XPLMFindDataRef("sim/multiplayer/position/plane1_z")
-local DR_ai1_psi  = XPLMFindDataRef("sim/multiplayer/position/plane1_psi")
-local DR_ai1_the  = XPLMFindDataRef("sim/multiplayer/position/plane1_the")
-local DR_ai1_phi  = XPLMFindDataRef("sim/multiplayer/position/plane1_phi")
+-- AI POSITION
+local DR_ai_x    = XPLMFindDataRef("sim/multiplayer/position/plane1_x")
+local DR_ai_y    = XPLMFindDataRef("sim/multiplayer/position/plane1_y")
+local DR_ai_z    = XPLMFindDataRef("sim/multiplayer/position/plane1_z")
+local DR_ai_psi  = XPLMFindDataRef("sim/multiplayer/position/plane1_psi")
+local DR_ai_the  = XPLMFindDataRef("sim/multiplayer/position/plane1_the")
+local DR_ai_phi  = XPLMFindDataRef("sim/multiplayer/position/plane1_phi")
+
+-- AI PHYSICS (The Missing Link)
+local DR_ai_vx   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_x")
+local DR_ai_vy   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_y")
+local DR_ai_vz   = XPLMFindDataRef("sim/multiplayer/position/plane1_v_z")
 
 -- OVERRIDE
-local DR_override = XPLMFindDataRef("sim/operation/override/override_plane_ai_1")
+local DR_ovr_pos = XPLMFindDataRef("sim/operation/override/override_plane_ai_1")
 
 -- =============================================================
--- 2. CONFIG & STATE
+-- 2. STATE
 -- =============================================================
 
 local active = false
-local current_dist_m = 0
-local START_DIST_NM = 5.0
-local SPEED_KTS = 600 
-
-local NM_TO_M = 1852.0
-local D2R = math.pi / 180.0
+local SPEED_KTS = 550
 local R2D = 180.0 / math.pi
+local D2R = math.pi / 180.0
+local NM_TO_M = 1852.0
 
--- HISTORY (For Vector Calculation)
-local prev_g_x = 0
-local prev_g_z = 0
-local has_history = false
+-- Internal Tracking
+local g_x = 0
+local g_y = 0
+local g_z = 0
 
 -- =============================================================
 -- 3. LOGIC LOOP
 -- =============================================================
 
-function loop_tcas_vector()
-    -- 1. Override Control
-    if DR_override then
-        if active then
-            XPLMSetDatai(DR_override, 1)
-        else
-            XPLMSetDatai(DR_override, 0)
-            -- Reset history when inactive
-            has_history = false
-            return
+function loop_tcas_v23()
+    -- 1. Manage Override
+    if not active then
+        if DR_ovr_pos and XPLMGetDatai(DR_ovr_pos) == 1 then
+             XPLMSetDatai(DR_ovr_pos, 0)
         end
-    end
-
-    -- 2. Update Distance (Closure)
-    local tick = 0.05
-    if SUPPORTS_FLOATING_WINDOWS == 1 then tick = 0.02 end
-    
-    local move_step = (SPEED_KTS * 0.5144) * tick
-    current_dist_m = current_dist_m - move_step
-
-    if current_dist_m < -200 then
-        active = false
         return
     end
 
-    -- 3. Calculate Target Position (Standard Head-On Logic)
-    local u_x = XPLMGetDataf(DR_user_x)
-    local u_y = XPLMGetDataf(DR_user_y)
-    local u_z = XPLMGetDataf(DR_user_z)
-    local u_psi = XPLMGetDataf(DR_user_psi)
+    -- Force Physics Override (God Mode)
+    if DR_ovr_pos then XPLMSetDatai(DR_ovr_pos, 1) end
 
+    -- 2. Get User Pos
+    local u_x = XPLMGetDataf(DR_u_x)
+    local u_y = XPLMGetDataf(DR_u_y)
+    local u_z = XPLMGetDataf(DR_u_z)
+
+    -- 3. Calculate Vector To User
+    local dx = u_x - g_x
+    local dy = u_y - g_y
+    local dz = u_z - g_z
+    local dist = math.sqrt(dx*dx + dz*dz)
+
+    -- 4. Move Ghost (Position Update)
+    local tick = 0.05
+    if SUPPORTS_FLOATING_WINDOWS == 1 then tick = 0.02 end
+    local move_step = (SPEED_KTS * 0.5144) * tick
+
+    if dist > 20 then
+        -- Normalize
+        local nx = dx / dist
+        local nz = dz / dist
+        
+        g_x = g_x + (nx * move_step)
+        g_z = g_z + (nz * move_step)
+        g_y = u_y -- Vertical Lock
+        
+        -- 5. Calculate Heading (Look where we are going)
+        -- atan2(x, -z) = Heading
+        local trk_rad = math.atan2(nx, -nz)
+        local trk_deg = trk_rad * R2D
+        if trk_deg < 0 then trk_deg = trk_deg + 360 end
+        
+        -- 6. CALCULATE VELOCITY VECTORS
+        -- This is the key. We match the dataref velocity to our movement.
+        local speed_mps = SPEED_KTS * 0.5144
+        
+        -- Re-calculate velocity components based on the Heading we just derived
+        -- X-Plane Trig: X = sin(psi), Z = -cos(psi)
+        local v_x = math.sin(trk_rad) * speed_mps
+        local v_z = -math.cos(trk_rad) * speed_mps
+        
+        -- 7. INJECT EVERYTHING
+        if DR_ai_x then XPLMSetDataf(DR_ai_x, g_x) end
+        if DR_ai_y then XPLMSetDataf(DR_ai_y, g_y) end
+        if DR_ai_z then XPLMSetDataf(DR_ai_z, g_z) end
+        
+        if DR_ai_psi then XPLMSetDataf(DR_ai_psi, trk_deg) end
+        if DR_ai_the then XPLMSetDataf(DR_ai_the, 0) end
+        if DR_ai_phi then XPLMSetDataf(DR_ai_phi, 0) end
+        
+        -- Inject the Physics Vectors
+        if DR_ai_vx then XPLMSetDataf(DR_ai_vx, v_x) end
+        if DR_ai_vz then XPLMSetDataf(DR_ai_vz, v_z) end
+        if DR_ai_vy then XPLMSetDataf(DR_ai_vy, 0) end
+    end
+
+    -- Auto-Abort
+    if dist < 50 then active = false end
+end
+
+do_every_frame("loop_tcas_v23()")
+
+-- =============================================================
+-- 4. SPAWN LOGIC
+-- =============================================================
+
+function spawn_kinematic()
+    local u_x = XPLMGetDataf(DR_u_x)
+    local u_y = XPLMGetDataf(DR_u_y)
+    local u_z = XPLMGetDataf(DR_u_z)
+    local u_psi = XPLMGetDataf(DR_u_psi)
+    
+    -- Spawn 5 NM Ahead
+    local dist_m = 5.0 * NM_TO_M
     local sin_v = math.sin(u_psi * D2R)
     local cos_v = math.cos(u_psi * D2R)
     
-    local g_x = u_x + (sin_v * current_dist_m)
-    local g_z = u_z - (cos_v * current_dist_m)
-    local g_y = u_y -- Co-Altitude
-
-    -- 4. VECTOR HEADING CALCULATION
-    -- Instead of guessing the heading, we measure it from the last frame.
-    local final_psi = (u_psi + 180) % 360 -- Fallback (Reciprocal)
-
-    if has_history then
-        local dx = g_x - prev_g_x
-        local dz = g_z - prev_g_z
-        
-        -- Only update heading if we actually moved (avoid divide by zero/jitter)
-        if (dx * dx + dz * dz) > 0.001 then
-            -- X-Plane Local Coords: +X=East, +Z=South
-            -- Math.atan2(x, -z) gives us the angle from North CW
-            local track_rad = math.atan2(dx, -dz)
-            local track_deg = track_rad * R2D
-            
-            -- Normalize to 0-360
-            if track_deg < 0 then track_deg = track_deg + 360 end
-            final_psi = track_deg
-        end
-    end
-
-    -- Update History
-    prev_g_x = g_x
-    prev_g_z = g_z
-    has_history = true
-
-    -- 5. Inject Data
-    if DR_ai1_x then XPLMSetDataf(DR_ai1_x, g_x) end
-    if DR_ai1_y then XPLMSetDataf(DR_ai1_y, g_y) end
-    if DR_ai1_z then XPLMSetDataf(DR_ai1_z, g_z) end
+    g_x = u_x + (sin_v * dist_m)
+    g_z = u_z - (cos_v * dist_m)
+    g_y = u_y
     
-    if DR_ai1_psi then XPLMSetDataf(DR_ai1_psi, final_psi) end
-    if DR_ai1_the then XPLMSetDataf(DR_ai1_the, 0) end
-    if DR_ai1_phi then XPLMSetDataf(DR_ai1_phi, 0) end
+    active = true
 end
 
-do_every_frame("loop_tcas_vector()")
-
 -- =============================================================
--- 4. GUI
+-- 5. GUI
 -- =============================================================
 
 function draw_tcas_gui()
     imgui.TextUnformatted(SCRIPT_NAME)
     imgui.Separator()
 
-    local agl = XPLMGetDataf(DR_user_agl)
-    if agl < 300 then
-        imgui.TextUnformatted("[!] WARNING: TOO LOW")
-    end
-
     if active then
-        imgui.TextUnformatted("!!! COLLISION ALERT !!!")
-        local d_nm = current_dist_m / NM_TO_M
-        local s_range = string.format("Range: %.2f NM", d_nm)
-        imgui.TextUnformatted(s_range)
+        imgui.TextUnformatted("!!! KINEMATIC LOOP !!!")
         
-        if imgui.Button("ABORT") then
-            active = false
-        end
+        local u_x = XPLMGetDataf(DR_u_x)
+        local u_z = XPLMGetDataf(DR_u_z)
+        local dx = g_x - u_x
+        local dz = g_z - u_z
+        local dist_nm = math.sqrt(dx*dx + dz*dz) / NM_TO_M
+        
+        imgui.TextUnformatted(string.format("Range: %.1f NM", dist_nm))
+        
+        if imgui.Button("ABORT") then active = false end
     else
         imgui.TextUnformatted("Status: READY")
-        if imgui.Button("INITIATE HEAD-ON MERGE") then
-            current_dist_m = START_DIST_NM * NM_TO_M
-            active = true
-            has_history = false -- Reset vector calc
+        if imgui.Button("SPAWN THREAT") then
+            spawn_kinematic()
         end
     end
 end
 
-local wnd = float_wnd_create(250, 200, 1, true)
-float_wnd_set_title(wnd, "TCAS V08")
+local wnd = float_wnd_create(250, 250, 1, true)
+float_wnd_set_title(wnd, "TCAS V23")
 float_wnd_set_imgui_builder(wnd, "draw_tcas_gui")
