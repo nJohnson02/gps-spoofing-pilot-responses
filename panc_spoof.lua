@@ -1,221 +1,237 @@
 -- =============================================================
--- C172 G1000 GPS SPOOFING SCENARIO (V24 - PHYSICS TRANSLATION)
--- "Parallel Ghost Track"
--- Based on the stable V20 architecture.
--- Math: Calculates Real XTE and subtracts a linear offset.
+-- C172 G1000 GPS SPOOFING SCENARIO (V30 - LIVE INPUTS)
+-- "Unified Drift + Live Configuration Inputs"
+-- 
+-- UPDATES V30:
+-- 1. INPUT BOXES: Added imgui.InputFloat fields to GUI.
+--    Allows changing Rates and Max Deviations at runtime.
+-- 2. PERSISTENCE: Defaults are set in CONFIG table below.
 -- =============================================================
 
-logMsg("SPOOF: Loading V24 (Physics Translation)...")
+logMsg("SPOOF: Loading V30 (Live Inputs)...")
 
 -- =============================================================
--- 1. DATAREF TARGETING
+-- 1. CONFIGURATION (DEFAULTS)
 -- =============================================================
-
-local TARGETS = {
-    -- INJECTORS (Write)
-    override_gps    = "sim/operation/override/override_gps",
-    hdef_dot        = "sim/cockpit/radios/gps_hdef_dot", 
-    zulu_time       = "sim/time/zulu_time_sec",
-    xpndr_fail      = "sim/operation/failures/rel_xpndr",
-
-    -- SENSORS (Read Only Physics)
-    real_lat        = "sim/flightmodel/position/latitude",
-    real_lon        = "sim/flightmodel/position/longitude",
-    real_psi        = "sim/flightmodel/position/psi" -- True Heading
-}
-
--- Validate Refs
-local VALID_REFS = {}
-function validate_datarefs()
-    for name, path in pairs(TARGETS) do
-        local ref = XPLMFindDataRef(path)
-        if ref then
-            VALID_REFS[name] = path
-        else
-            logMsg("SPOOF: Missing -> " .. path)
-        end
-    end
-end
-validate_datarefs()
-
--- =============================================================
--- 2. STATE VARIABLES
--- =============================================================
-
-local attack_active = false
-
--- The "Anchor" (Original Course Line)
-local origin_lat = 0
-local origin_lon = 0
-local origin_heading = 0 
-
--- The Drift Offset
-local current_drift_nm = 0
 
 local CONFIG = {
-    -- DRIFT RATE (NM per frame)
-    -- 0.0003 is approx 0.5 NM per minute.
-    drift_rate_nm = 0.0001,
-    
-    -- SENSITIVITY (For Dot Conversion)
-    -- 0.3 NM = Full Scale (Approach Mode)
-    full_scale_nm = 0.3,
+    -- H_DRIFT: 0.0001 is approx 0.5 NM per minute
+    rate_h_nm = 0.0001,
+    max_h_nm  = 2.0, 
+
+    -- V_DRIFT: 0.05 is approx 150 fpm
+    rate_v_m  = 0.05,
+    max_v_m   = 300.0,
+
+    -- SCALING (Instrument Sensitivity)
+    scale_h_nm = 0.3,    -- HSI Full Scale
+    scale_v_m  = 150.0,  -- VDI Full Scale
     
     -- JITTER
-    jitter_sec = 45
+    jitter_amp = 45      -- Seconds
 }
 
 -- =============================================================
--- 3. MATH HELPERS
+-- 2. DATAREFS
+-- =============================================================
+
+local D = {
+    -- WRITE
+    override  = "sim/operation/override/override_gps",
+    h_dot     = "sim/cockpit/radios/gps_hdef_dot", 
+    v_dot     = "sim/cockpit/radios/gps_vdef_dot", 
+    time_sec  = "sim/time/zulu_time_sec",
+    xpdr_fail = "sim/operation/failures/rel_xpndr",
+
+    -- READ
+    lat       = "sim/flightmodel/position/latitude",
+    lon       = "sim/flightmodel/position/longitude",
+    ele       = "sim/flightmodel/position/elevation",
+    psi       = "sim/flightmodel/position/psi"
+}
+
+for k, v in pairs(D) do
+    if not XPLMFindDataRef(v) then logMsg("SPOOF ERR: Missing " .. v) end
+end
+
+-- =============================================================
+-- 3. STATE MANAGEMENT
+-- =============================================================
+
+local state = {
+    drift_active = false,
+    xpdr_active = false,
+    jitter_active = false,
+    
+    -- Soft Lock Offsets
+    lock_h_dots = 0,
+    lock_v_dots = 0,
+    
+    -- Drifts
+    drift_h = 0,
+    drift_v = 0
+}
+
+local anchor = { lat=0, lon=0, alt=0, hdg=0, set=false }
+
+-- =============================================================
+-- 4. MATH CORE
 -- =============================================================
 
 local D2R = math.pi / 180.0
-local R2D = 180.0 / math.pi
 local ERAD = 6371000
 
--- Calculate Distance (m) and Bearing (deg)
 function get_geo_vector(lat1, lon1, lat2, lon2)
     local dLat = (lat2 - lat1) * D2R
     local dLon = (lon2 - lon1) * D2R
-    local a = math.sin(dLat/2) * math.sin(dLat/2) +
-              math.cos(lat1 * D2R) * math.cos(lat2 * D2R) *
-              math.sin(dLon/2) * math.sin(dLon/2)
+    local a = math.sin(dLat/2)^2 + math.cos(lat1*D2R) * math.cos(lat2*D2R) * math.sin(dLon/2)^2
     local c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    local dist_m = ERAD * c
-    
-    local y = math.sin(dLon) * math.cos(lat2 * D2R)
-    local x = math.cos(lat1 * D2R) * math.sin(lat2 * D2R) -
-              math.sin(lat1 * D2R) * math.cos(lat2 * D2R) * math.cos(dLon)
-    local brg = math.atan2(y, x) * R2D
-    
-    return dist_m, (brg + 360) % 360
+    local d = ERAD * c
+    local y = math.sin(dLon) * math.cos(lat2*D2R)
+    local x = math.cos(lat1*D2R) * math.sin(lat2*D2R) - math.sin(lat1*D2R) * math.cos(lat2*D2R) * math.cos(dLon)
+    local b = math.atan2(y, x) * 180 / math.pi
+    return d, (b + 360) % 360
+end
+
+function clamp_dots(val)
+    if val > 2.5 then return 2.5 end
+    if val < -2.5 then return -2.5 end
+    return val
 end
 
 -- =============================================================
--- 4. MAIN LOGIC LOOP
+-- 5. LOGIC LOOP
 -- =============================================================
 
-function run_spoof_logic()
-    -- Safety
-    if not attack_active then
-        if VALID_REFS.override_gps then set(VALID_REFS.override_gps, 0) end
-        return
-    end
+function run_spoof_v30()
+    -- 1. DRIFT LOGIC (Unified)
+    if state.drift_active then
+        set(D.override, 1)
 
-    if VALID_REFS.override_gps then set(VALID_REFS.override_gps, 1) end
+        if not anchor.set then
+            anchor.lat = get(D.lat)
+            anchor.lon = get(D.lon)
+            anchor.alt = get(D.ele)
+            anchor.hdg = get(D.psi)
+            anchor.set = true
+        end
 
-    -- === 1. INCREMENT GHOST DRIFT (Translation) ===
-    -- This pushes the "Ghost Line" further away from the "Real Line"
-    -- We assume drift to the RIGHT (+), so Ghost Line is Right of Real Line.
-    current_drift_nm = current_drift_nm + CONFIG.drift_rate_nm
-
-    -- === 2. CALCULATE REAL XTE (Physics) ===
-    local curr_lat = get(VALID_REFS.real_lat)
-    local curr_lon = get(VALID_REFS.real_lon)
-    
-    -- Vector from Anchor -> Plane
-    local dist_m, bearing_to_plane = get_geo_vector(origin_lat, origin_lon, curr_lat, curr_lon)
-    
-    -- Angle Difference (Plane Bearing vs Track Heading)
-    local angle_diff = (bearing_to_plane - origin_heading)
-    
-    -- Real XTE in NM (Positive = Plane is Right of Track)
-    local real_xte_m = dist_m * math.sin(angle_diff * D2R)
-    local real_xte_nm = real_xte_m / 1852.0
-    
-    -- === 3. CALCULATE SPOOFED NEEDLE ===
-    -- The instrument should show the distance from the GHOST line, not the Real line.
-    -- Indicated Error = (Where I am) - (Where the Ghost Line is)
-    -- If Ghost Line is 1 NM Right (+1), and I am 1 NM Right (+1), result is 0 (Centered).
-    local indicated_xte_nm = real_xte_nm - current_drift_nm
-    
-    -- Convert to Dots
-    local h_dots = (indicated_xte_nm / CONFIG.full_scale_nm) * 2.0
-    
-    -- Clamp (-2.5 to 2.5)
-    if h_dots > 2.5 then h_dots = 2.5 end
-    if h_dots < -2.5 then h_dots = -2.5 end
-    
-    -- Inject (Invert sign because +XTE usually means "Needle Left")
-    if VALID_REFS.hdef_dot then set(VALID_REFS.hdef_dot, -h_dots) end
-
-    -- === 4. CLOCK JITTER ===
-    if VALID_REFS.zulu_time then
-        local jitter = math.sin(os.clock() * 15) * CONFIG.jitter_sec
-        local current_time = get(VALID_REFS.zulu_time)
-        set(VALID_REFS.zulu_time, current_time + (jitter * 0.01))
-    end
-end
-
-do_every_frame("run_spoof_logic()")
-
--- =============================================================
--- 5. CONTROLS
--- =============================================================
-
-function toggle_attack()
-    attack_active = not attack_active
-    
-    if attack_active then
-        -- SNAPSHOT ORIGIN
-        origin_lat = get(VALID_REFS.real_lat)
-        origin_lon = get(VALID_REFS.real_lon)
-        origin_heading = get(VALID_REFS.real_psi)
+        local curr_lat, curr_lon = get(D.lat), get(D.lon)
+        local dist_m, bearing = get_geo_vector(anchor.lat, anchor.lon, curr_lat, curr_lon)
+        local angle_diff = bearing - anchor.hdg
         
-        -- RESET DRIFT
-        current_drift_nm = 0
-        
-        -- FAIL XPDR
-        if VALID_REFS.xpndr_fail then set(VALID_REFS.xpndr_fail, 6) end
-        
+        local real_xte_m = dist_m * math.sin(angle_diff * D2R)
+        local real_xte_nm = real_xte_m / 1852.0
+        local real_vde_m = get(D.ele) - anchor.alt
+
+        -- ACCUMULATE DRIFT (Using dynamic CONFIG values)
+        if state.drift_h < CONFIG.max_h_nm then
+            state.drift_h = state.drift_h + CONFIG.rate_h_nm
+        end
+
+        if state.drift_v > -CONFIG.max_v_m then
+            state.drift_v = state.drift_v - CONFIG.rate_v_m
+        end
+
+        -- INJECT
+        local ind_xte_nm = real_xte_nm - state.drift_h
+        local h_dots = (ind_xte_nm / CONFIG.scale_h_nm) * 2.0
+        set(D.h_dot, -clamp_dots(h_dots + state.lock_h_dots))
+
+        local ind_vde_m = real_vde_m - state.drift_v
+        local v_dots = (ind_vde_m / CONFIG.scale_v_m) * 2.0
+        set(D.v_dot, -clamp_dots(v_dots + state.lock_v_dots))
+
     else
-        -- STOP ATTACK
-        if VALID_REFS.xpndr_fail then set(VALID_REFS.xpndr_fail, 0) end
-        if VALID_REFS.override_gps then set(VALID_REFS.override_gps, 0) end
+        set(D.override, 0)
+        anchor.set = false
+    end
+    
+    -- 2. JITTER
+    if state.jitter_active then
+        local j = math.sin(os.clock() * 15) * CONFIG.jitter_amp
+        set(D.time_sec, get(D.time_sec) + (j * 0.01))
     end
 end
 
+do_every_frame("run_spoof_v30()")
+
 -- =============================================================
--- 6. GUI
+-- 6. TOGGLE FUNCTIONS
 -- =============================================================
 
-function draw_spoof_gui()
-    imgui.TextUnformatted("GPS SPOOF V24")
-    imgui.TextUnformatted("Physics Translation")
+function toggle_drift()
+    state.drift_active = not state.drift_active
+    if state.drift_active then
+        state.drift_h = 0
+        state.drift_v = 0
+        state.lock_h_dots = -(get(D.h_dot)) 
+        state.lock_v_dots = -(get(D.v_dot))
+    end
+end
+
+function toggle_xpdr()
+    state.xpdr_active = not state.xpdr_active
+    if state.xpdr_active then set(D.xpdr_fail, 6) else set(D.xpdr_fail, 0) end
+end
+
+function toggle_jitter()
+    state.jitter_active = not state.jitter_active
+end
+
+-- =============================================================
+-- 7. GUI
+-- =============================================================
+
+function draw_v30_gui()
+    imgui.TextUnformatted("GPS SPOOF V30 - LIVE INPUTS")
     imgui.Separator()
     
-    if attack_active then
-        imgui.TextUnformatted("!!! TRACK SHIFTING !!!")
-        
-        local off_str = string.format("Ghost Shift: %.2f NM", current_drift_nm)
-        imgui.TextUnformatted(off_str)
-        
-    else
-        imgui.TextUnformatted("... SIGNAL CLEAR ...")
-    end
+    -- STATUS READOUT
+    local h_status = string.format("Current H-Drift: %.2f NM", state.drift_h)
+    local v_status = string.format("Current V-Drift: %.1f M", state.drift_v)
+    imgui.TextUnformatted(h_status)
+    imgui.TextUnformatted(v_status)
     
-    imgui.Dummy(10,5)
+    imgui.Dummy(10,10)
+    imgui.Separator()
+    imgui.TextUnformatted("SETTINGS (Typable)")
+
+    -- INPUT BOXES
+    -- Format: changed, val = imgui.InputFloat(label, val, step, step_fast, format)
     
-    if imgui.Button(attack_active and "CEASE ATTACK" or "INITIATE ATTACK") then
-        toggle_attack()
-    end
-    
-    imgui.Dummy(10,5)
+    local chg_rh, new_rh = imgui.InputFloat("H Rate (NM/f)", CONFIG.rate_h_nm, 0.0001, 0.001, "%.5f")
+    if chg_rh then CONFIG.rate_h_nm = new_rh end
+
+    local chg_rv, new_rv = imgui.InputFloat("V Rate (M/f)", CONFIG.rate_v_m, 0.01, 0.1, "%.3f")
+    if chg_rv then CONFIG.rate_v_m = new_rv end
+
+    local chg_mh, new_mh = imgui.InputFloat("Max H (NM)", CONFIG.max_h_nm, 0.1, 1.0, "%.1f")
+    if chg_mh then CONFIG.max_h_nm = new_mh end
+
+    local chg_mv, new_mv = imgui.InputFloat("Max V (M)", CONFIG.max_v_m, 10.0, 50.0, "%.0f")
+    if chg_mv then CONFIG.max_v_m = new_mv end
+
+    imgui.Dummy(10,10)
     imgui.Separator()
     
-    imgui.TextUnformatted("Active Effects:")
-    
-    if attack_active then
-        imgui.TextUnformatted("[X] Parallel Track Shift")
-        imgui.TextUnformatted("[X] Clock Jitter")
-        imgui.TextUnformatted("[X] XPDR Hard Fail")
-    else
-        imgui.TextUnformatted("[ ] Parallel Track Shift")
-        imgui.TextUnformatted("[ ] Clock Jitter")
-        imgui.TextUnformatted("[ ] XPDR Hard Fail")
+    -- BUTTONS
+    if imgui.Button(state.drift_active and "SPOOF NAVIGATION: ACTIVE" or "SPOOF NAVIGATION: INACTIVE") then
+        toggle_drift()
     end
+
+    imgui.Dummy(10,5)
+
+    if imgui.Button(state.xpdr_active and "XPDR FAIL: ON" or "XPDR FAIL: OFF") then
+        toggle_xpdr()
+    end
+    
+    if imgui.Button(state.jitter_active and "TIME JITTER: ON" or "TIME JITTER: OFF") then
+        toggle_jitter()
+    end
+
 end
 
-spoof_wnd = float_wnd_create(250, 350, 1, true)
-float_wnd_set_title(spoof_wnd, "Spoof V24")
-float_wnd_set_imgui_builder(spoof_wnd, "draw_spoof_gui")
+spoof_wnd = float_wnd_create(350, 450, 1, true)
+float_wnd_set_title(spoof_wnd, "Spoof V30")
+float_wnd_set_imgui_builder(spoof_wnd, "draw_v30_gui")
