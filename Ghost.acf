@@ -29024,7 +29024,7 @@ P acf/_esys_bus_bit_add/rel_startr7 0
 P acf/_esys_bus_bit_add/rel_xpndr 1
 P acf/_esys_bus_bit_add/rel_yaw_damp 0
 P acf/_exhaust_hp_to_lb 0.000000000
-P acf/_exhaust_rat 1.000000000
+P acf/_exhaust_rat 0.000000000
 P acf/_face_jet 0.000000000
 P acf/_face_rocket 0.000000000
 P acf/_fadec_EQ_mixture 0

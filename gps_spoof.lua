@@ -184,18 +184,18 @@ end
 -- =============================================================
 
 function draw_v30_gui()
-    imgui.TextUnformatted("GPS SPOOF V30 - LIVE INPUTS")
+    imgui.TextUnformatted("GPS SPOOF V30")
     imgui.Separator()
     
     -- STATUS READOUT
-    local h_status = string.format("Current H-Drift: %.2f NM", state.drift_h)
-    local v_status = string.format("Current V-Drift: %.1f M", state.drift_v)
+    local h_status = string.format("Horizonatal Error: %.2f NM", state.drift_h)
+    local v_status = string.format("Vertical Error: %.1f M", state.drift_v)
     imgui.TextUnformatted(h_status)
     imgui.TextUnformatted(v_status)
     
     imgui.Dummy(10,10)
     imgui.Separator()
-    imgui.TextUnformatted("SETTINGS (Typable)")
+    imgui.TextUnformatted("SETTINGS")
 
     -- INPUT BOXES
     -- Format: changed, val = imgui.InputFloat(label, val, step, step_fast, format)
@@ -216,22 +216,20 @@ function draw_v30_gui()
     imgui.Separator()
     
     -- BUTTONS
-    if imgui.Button(state.drift_active and "SPOOF NAVIGATION: ACTIVE" or "SPOOF NAVIGATION: INACTIVE") then
+    if imgui.Button(state.drift_active and "GPS Spoofing: ACTIVE" or "GPS Spoofing: inactive") then
         toggle_drift()
     end
 
-    imgui.Dummy(10,5)
-
-    if imgui.Button(state.xpdr_active and "XPDR FAIL: ON" or "XPDR FAIL: OFF") then
+    if imgui.Button(state.xpdr_active and "XPDR Fail: ACTIVE" or "XPDR Fail: inactive") then
         toggle_xpdr()
     end
     
-    if imgui.Button(state.jitter_active and "TIME JITTER: ON" or "TIME JITTER: OFF") then
+    if imgui.Button(state.jitter_active and "Time Jitter: ACTIVE" or "Time Jitter: inactive") then
         toggle_jitter()
     end
 
 end
 
 spoof_wnd = float_wnd_create(350, 450, 1, true)
-float_wnd_set_title(spoof_wnd, "Spoof V30")
+float_wnd_set_title(spoof_wnd, "GPS Spoof V30")
 float_wnd_set_imgui_builder(spoof_wnd, "draw_v30_gui")
